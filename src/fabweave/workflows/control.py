@@ -10,6 +10,7 @@ from fabweave.core.decision import Decision, allow, deny
 from fabweave.core.events import EventLog
 from fabweave.core.timebox import TimeBox
 from fabweave.dedication.tool import DedicationPolicy, policy_decision
+from fabweave.dispatch.freeze import FreezeRegistry
 from fabweave.dispatch.priority import DispatchCandidate, rank_candidates
 from fabweave.energy.demand import demand_violations
 from fabweave.genealogy.carrier import GenealogyGraph
@@ -64,6 +65,52 @@ def rank_releasable(
             blocked = blocked or not release_decision(state, expected, now).allowed
         evaluated.append(replace(candidate, active_hold=blocked))
     return rank_candidates(evaluated, now)
+
+
+def rank_unfrozen(
+    candidates: list[DispatchCandidate],
+    lot_classes: dict[str, str],
+    registry: FreezeRegistry,
+    now: int,
+) -> list[DispatchCandidate]:
+    evaluated: list[DispatchCandidate] = []
+    for candidate in candidates:
+        lot_class = lot_classes.get(candidate.lot_id)
+        blocked = candidate.active_hold
+        if lot_class is not None:
+            blocked = blocked or not registry.decision(lot_class, now).allowed
+        evaluated.append(replace(candidate, active_hold=blocked))
+    return rank_candidates(evaluated, now)
+
+
+@dataclass(frozen=True, slots=True)
+class FreezeGateRecord:
+    decision: Decision
+    event_sequence: int
+
+
+def record_freeze_gate(
+    log: EventLog,
+    request_id: str,
+    registry: FreezeRegistry,
+    lot_class: str,
+    at: int,
+) -> FreezeGateRecord:
+    decision = registry.decision(lot_class, at)
+    event = log.append(
+        f"freeze-gate:{request_id}",
+        0,
+        request_id,
+        at,
+        "freeze_gate_evaluated",
+        {
+            "lot_class": lot_class,
+            "allowed": decision.allowed,
+            "reasons": list(decision.reasons),
+            "evidence": dict(decision.evidence),
+        },
+    )
+    return FreezeGateRecord(decision, event.sequence)
 
 
 def reserve_qualified(

@@ -14,6 +14,16 @@ from fabweave.core.timebox import TimeBox, covered_duration, merge_timeboxes
 from fabweave.core.units import fraction_to_ppm, ppm_to_fraction
 from fabweave.core.versioning import RevisionHistory
 from fabweave.dedication.tool import DedicationPolicy, policy_decision
+from fabweave.dispatch.freeze import (
+    ENGINEERING,
+    FREEZE,
+    HOT,
+    NORMAL,
+    OVERRIDE,
+    FreezeRegistry,
+    FreezeRule,
+    freeze_decision,
+)
 from fabweave.dispatch.priority import DispatchCandidate, rank_candidates
 from fabweave.energy.demand import coincident_peak, demand_violations
 from fabweave.genealogy.carrier import GenealogyGraph
@@ -41,7 +51,9 @@ from fabweave.workflows.control import (
     powered_assignment,
     qualified_assignment,
     rank_releasable,
+    rank_unfrozen,
     record_containment,
+    record_freeze_gate,
     reserve_qualified,
     rework_release_decision,
 )
@@ -125,6 +137,108 @@ def test_dispatch_excludes_held_and_frozen_lots_and_breaks_ties_stably():
         DispatchCandidate("LOT-F", 0.1, 1, frozen_until=20),
     ]
     assert [item.lot_id for item in rank_candidates(candidates, 10)] == ["LOT-A", "LOT-B"]
+
+
+def test_freeze_rule_validates_scope_kind_version_and_grantor():
+    with pytest.raises(ValueError):
+        FreezeRule("FRZ-1", 0, FREEZE, frozenset({NORMAL}), TimeBox(0, 10))
+    with pytest.raises(ValueError):
+        FreezeRule("FRZ-1", 1, "THAW", frozenset({NORMAL}), TimeBox(0, 10))
+    with pytest.raises(ValueError):
+        FreezeRule("FRZ-1", 1, FREEZE, frozenset(), TimeBox(0, 10))
+    with pytest.raises(ValueError):
+        FreezeRule("FRZ-1", 1, FREEZE, frozenset({"UNKNOWN"}), TimeBox(0, 10))
+    with pytest.raises(ValueError):
+        FreezeRule("FRZ-1", 1, OVERRIDE, frozenset({NORMAL}), TimeBox(0, 10))
+    with pytest.raises(ValueError):
+        FreezeRule("FRZ-1", 1, FREEZE, frozenset({NORMAL}), TimeBox(0, 10), granted_by="MGR-1")
+    with pytest.raises(ValueError):
+        freeze_decision([], "UNKNOWN", 0)
+
+
+def test_freeze_scopes_denial_to_selected_lot_classes():
+    rules = [FreezeRule("FRZ-1", 1, FREEZE, frozenset({ENGINEERING}), TimeBox(0, 100))]
+    assert freeze_decision([], NORMAL, 50).allowed
+    assert freeze_decision(rules, NORMAL, 50).allowed
+    assert freeze_decision(rules, HOT, 50).allowed
+    frozen = freeze_decision(rules, ENGINEERING, 50)
+    assert frozen.reasons == ("dispatch_frozen",)
+    assert frozen.evidence["winning_rule_id"] == "FRZ-1"
+
+
+def test_override_punctures_freeze_only_inside_its_window():
+    rules = [
+        FreezeRule("FRZ-1", 1, FREEZE, frozenset({NORMAL}), TimeBox(0, 100), priority=1),
+        FreezeRule("OVR-1", 1, OVERRIDE, frozenset({NORMAL}), TimeBox(20, 30), priority=2, granted_by="MGR-1"),
+    ]
+    assert freeze_decision(rules, NORMAL, 10).reasons == ("dispatch_frozen",)
+    punctured = freeze_decision(rules, NORMAL, 25)
+    assert punctured.allowed and punctured.evidence["override_expires_at"] == 30
+    assert freeze_decision(rules, NORMAL, 30).reasons == ("dispatch_frozen",)
+
+
+def test_overlapping_rules_resolve_by_priority_version_then_effective_time():
+    rules = [
+        FreezeRule("FRZ-1", 1, FREEZE, frozenset({HOT}), TimeBox(0, 100), priority=1),
+        FreezeRule("OVR-1", 1, OVERRIDE, frozenset({HOT}), TimeBox(0, 100), priority=2, granted_by="MGR-1"),
+        FreezeRule("FRZ-2", 2, FREEZE, frozenset({HOT}), TimeBox(0, 100), priority=2, effective_at=10),
+        FreezeRule("OVR-2", 2, OVERRIDE, frozenset({HOT}), TimeBox(0, 100), priority=2, effective_at=20, granted_by="MGR-2"),
+    ]
+    assert freeze_decision(rules, HOT, 5).evidence["winning_rule_id"] == "OVR-1"
+    assert freeze_decision(rules, HOT, 15).reasons == ("dispatch_frozen",)
+    late = freeze_decision(rules, HOT, 25)
+    assert late.allowed and late.evidence["winning_rule_id"] == "OVR-2"
+
+
+def test_registry_supersedes_older_versions_and_rejects_backwards_publish():
+    registry = FreezeRegistry()
+    registry.publish(FreezeRule("FRZ-1", 1, FREEZE, frozenset({NORMAL}), TimeBox(0, 100)))
+    registry.publish(FreezeRule("FRZ-1", 2, FREEZE, frozenset({ENGINEERING}), TimeBox(0, 100), effective_at=50))
+    assert registry.decision(NORMAL, 40).reasons == ("dispatch_frozen",)
+    assert registry.decision(NORMAL, 60).allowed
+    assert registry.decision(ENGINEERING, 60).reasons == ("dispatch_frozen",)
+    with pytest.raises(ValueError):
+        registry.publish(FreezeRule("FRZ-1", 2, FREEZE, frozenset({NORMAL}), TimeBox(0, 100), effective_at=60))
+    with pytest.raises(ValueError):
+        registry.publish(FreezeRule("FRZ-1", 3, FREEZE, frozenset({NORMAL}), TimeBox(0, 100), effective_at=40))
+
+
+def test_freeze_explanation_replays_history_with_winner_and_contenders():
+    registry = FreezeRegistry()
+    registry.publish(FreezeRule("FRZ-1", 1, FREEZE, frozenset({NORMAL}), TimeBox(0, 100), priority=1))
+    registry.publish(FreezeRule("OVR-1", 1, OVERRIDE, frozenset({NORMAL}), TimeBox(20, 30), priority=2, granted_by="MGR-1"))
+    early = registry.explain(NORMAL, 25)
+    assert early.decision.allowed
+    assert early.winner is not None and early.winner.rule_id == "OVR-1"
+    assert [rule.rule_id for rule in early.contenders] == ["OVR-1", "FRZ-1"]
+    assert early.decision.evidence["granted_by"] == "MGR-1"
+    registry.publish(FreezeRule("FRZ-2", 1, FREEZE, frozenset({NORMAL}), TimeBox(40, 50), priority=9))
+    assert registry.explain(NORMAL, 25).decision == early.decision
+
+
+def test_rank_unfrozen_applies_freeze_rules_before_dispatch():
+    registry = FreezeRegistry()
+    registry.publish(FreezeRule("FRZ-1", 1, FREEZE, frozenset({ENGINEERING}), TimeBox(0, 100)))
+    candidates = [
+        DispatchCandidate("LOT-N", 1, 2),
+        DispatchCandidate("LOT-E", 1, 2),
+        DispatchCandidate("LOT-H", 1, 2),
+    ]
+    classes = {"LOT-N": NORMAL, "LOT-E": ENGINEERING, "LOT-H": HOT}
+    assert [item.lot_id for item in rank_unfrozen(candidates, classes, registry, 10)] == ["LOT-H", "LOT-N"]
+
+
+def test_record_freeze_gate_is_idempotent_and_binds_the_decision():
+    registry = FreezeRegistry()
+    registry.publish(FreezeRule("FRZ-1", 1, FREEZE, frozenset({NORMAL}), TimeBox(0, 100)))
+    log = EventLog()
+    first = record_freeze_gate(log, "GATE-1", registry, NORMAL, 10)
+    replay = record_freeze_gate(log, "GATE-1", registry, NORMAL, 10)
+    assert first == replay
+    assert not first.decision.allowed and first.event_sequence == 1
+    registry.publish(FreezeRule("OVR-1", 1, OVERRIDE, frozenset({NORMAL}), TimeBox(0, 100), priority=1, granted_by="MGR-1"))
+    with pytest.raises(ValueError):
+        record_freeze_gate(log, "GATE-1", registry, NORMAL, 10)
 
 
 def test_reticle_batch_reservation_is_atomic_and_idempotent():
